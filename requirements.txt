@@ -1,0 +1,13 @@
+# Obrigatórias
+python-mpv
+screeninfo
+# Opcionais (a app oferece instalá-las no arranque)
+numpy
+ndi-python
+zeroconf
+tkinterdnd2
+psutil
+yt-dlp[default]
+pillow
+certifi
+sounddevice

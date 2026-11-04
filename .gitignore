@@ -1,0 +1,12 @@
+# Registos e caches da app
+player_logs/
+player_cache/
+__pycache__/
+*.pyc
+# Binários externos (descarregar à parte, ver README)
+*.dll
+*.exe
+# Dados pessoais
+cookies*.txt
+*.mmp
+.leitor_sync/

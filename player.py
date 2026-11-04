@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Leitor Multimédia Multi-Monitor / Multi-Monitor Media Player  (v5.36.49)
+Leitor Multimédia Multi-Monitor / Multi-Monitor Media Player  (v5.36.51)
 ------------------------------------------------------------------
 - Control interface on one screen (Tkinter, very light); two independent fullscreen
   outputs (Output 1 / Output 2) on other screens, each one a libmpv window.
@@ -51,6 +51,29 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+# --- Packaged exe (PyInstaller): sys.executable IS this program, so «python -m …» would start another copy of the app ---
+FROZEN = bool(getattr(sys, "frozen", False))
+if FROZEN and len(sys.argv) > 1:
+    if sys.argv[1] == "--yt-dlp":                      # internal mode: this exe acts as yt-dlp (used instead of «python -m yt_dlp»)
+        for _fd, _name, _mode in ((0, "stdin", "r"), (1, "stdout", "w"), (2, "stderr", "w")):
+            if getattr(sys, _name, None) is None:
+                try:
+                    setattr(sys, _name, open(_fd, _mode, encoding="utf-8", errors="replace", closefd=False))
+                except Exception:
+                    pass
+        try:
+            import yt_dlp as _ytd
+            sys.argv = ["yt-dlp"] + sys.argv[2:]
+            _ytd.main()
+        except SystemExit:
+            raise
+        except BaseException as _exc:
+            print(f"ERROR: yt-dlp is not available in this build ({_exc})", file=sys.stderr)
+        os._exit(1)
+    if sys.argv[1] in ("-m", "-c", "-u", "-V", "--version"):   # a leftover «python …» call must never open another window
+        os._exit(0)
+YT_DLP_SELF = [sys.executable, "--yt-dlp"] if FROZEN else [sys.executable, "-m", "yt_dlp"]
+
 # --- Platform preparation (before importing mpv) ------------------------------------
 if sys.platform == "win32":
     try:
@@ -89,7 +112,7 @@ def _ensure_dependencies():
     import importlib
     import importlib.util
     mode = os.environ.get("PLAYER_AUTOINSTALL", "").lower()
-    if mode == "no":
+    if mode == "no" or FROZEN:                      # the packaged exe carries its libraries: nothing to install (and no pip)
         return
     folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "player_logs")
     skip_file = os.path.join(folder, "deps_skipped.txt")
@@ -504,7 +527,7 @@ def setup_diagnostics(base_dir=None):
     except Exception:
         pass
     _install_native_crash_reporter(folder)
-    diag_log(f"=== start v5.36.49 pid={os.getpid()} python={sys.version.split()[0]} platform={sys.platform} ===")
+    diag_log(f"=== start v5.36.51 pid={os.getpid()} python={sys.version.split()[0]} platform={sys.platform} ===")
     if sys.platform == "win32" and sys.version_info >= (3, 13):
         diag_log("NOTE: Python 3.13+ uses Tcl/Tk 9; a native crash in tcl9tk90.dll was reported with it. Python 3.11 / 3.12 (Tk 8.6) is the safer choice.")
     # run state: tells the next start whether this run ended cleanly, and when it was last alive
@@ -1189,6 +1212,8 @@ def yt_is_formats_error(text):
 
 def yt_update_ytdlp():
     """pip install -U yt-dlp (with its default extras). (ok, last output line)"""
+    if FROZEN:
+        return False, "packaged app: replace yt-dlp.exe next to the program (or build the exe again with a newer yt-dlp)"
     try:
         r = subprocess.run([sys.executable, "-m", "pip", "install", "-U", "yt-dlp[default]"], capture_output=True,
                            text=True, timeout=300, encoding="utf-8", errors="replace")
@@ -1223,6 +1248,7 @@ def yt_dlp_exe():
 def _yt_dlp_exe_find():
     names = ("yt-dlp.exe", "yt-dlp") if sys.platform == "win32" else ("yt-dlp",)
     dirs = [os.path.join(os.path.dirname(sys.executable), "Scripts"), os.path.dirname(sys.executable)]
+    dirs += [os.path.dirname(os.path.abspath(__file__)), getattr(sys, "_MEIPASS", "") or os.path.dirname(sys.executable)]
     try:
         import site
         dirs.append(os.path.join(site.getuserbase(), "Scripts"))
@@ -2542,6 +2568,91 @@ class NdiSender:
         return self._black, False
 
 
+class OutputSource:
+    """«Output as Input»: the picture of another output (the frames of its mpv after the whole filter chain, transform included,
+    exactly what the NDI output sends) as a live input. Same interface as RtmpListener / NdiReceiver / CaptureSource."""
+
+    def __init__(self, ffmpeg, player_fn, size_fn, fps_fn, udp_ports, on_change, name="output"):
+        self.ffmpeg, self.udp_ports, self.on_change = ffmpeg, list(udp_ports), on_change
+        self.state, self.error, self.rejected, self.gen = "waiting", "", "", 0
+        self.progress = ""
+        self.g = NdiSender(name, player_fn, size_fn, fps_fn)       # only its grabber is used (never started)
+        self._stop, self._thread = threading.Event(), None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name="output-as-input")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def refresh(self):
+        """Reads the source output's fps / canvas from Tk. MAIN THREAD ONLY."""
+        self.g.refresh()
+
+    def _set(self, state, error=""):
+        if (state, error) != (self.state, self.error):
+            if state == "live" and self.state != "live":
+                self.gen += 1
+            self.state, self.error = state, error
+            try:
+                self.on_change(self)
+            except Exception:
+                pass
+
+    def _run(self):
+        hub, nxt = None, time.perf_counter()
+        try:
+            while not self._stop.is_set():
+                try:
+                    player = self.g.player_fn()
+                except Exception:
+                    player = None
+                if player is None:                                       # the source output is off
+                    if hub is not None:
+                        hub.close()
+                        hub = None
+                    self._set("waiting")
+                    self._stop.wait(0.4)
+                    nxt = time.perf_counter()
+                    continue
+                fps = max(1.0, min(60.0, float(self.g.fps_value or 30.0)))
+                try:
+                    frame, _real = self.g._grab()
+                    if frame.ndim != 3 or frame.shape[2] != 4:
+                        raise RuntimeError("capture format")
+                    h, w = int(frame.shape[0]), int(frame.shape[1])
+                    if hub is not None and (hub.size != (w, h) or not hub.alive()):
+                        hub.close()
+                        hub = None
+                    if hub is None:
+                        hub = NdiHub(self.ffmpeg, (w, h), fps_fraction(fps), 48000, self.udp_ports, silent=True)
+                        diag_log(f"output as input '{self.g.name}': {w}x{h} at {fps:g} fps")
+                    hub.write_video(frame.tobytes())
+                    if hub.frames >= 3 and hub.alive():
+                        self._set("live")
+                except _NoRawShot as exc:
+                    self._set("error", str(exc)[:100])
+                    self._stop.wait(2.0)
+                except (OSError, ValueError, RuntimeError) as exc:
+                    diag_log(f"output as input '{self.g.name}': {type(exc).__name__}: {str(exc)[:120]}")
+                    if hub is not None:
+                        hub.close()
+                        hub = None
+                    self._set("waiting")
+                    self._stop.wait(0.5)
+                nxt += 1.0 / fps
+                lag = nxt - time.perf_counter()
+                if lag > 0:
+                    self._stop.wait(lag)
+                elif lag < -0.5:
+                    nxt = time.perf_counter()
+        finally:
+            if hub is not None:
+                hub.close()
+            self._set("waiting")
+
+
 RTMP_BASE_PORT = 1935
 
 
@@ -2673,7 +2784,7 @@ class RtmpListener:
 
 
 # ---- Capture inputs: cameras / capture cards / microphones (DirectShow), screen and window (GDI) through ffmpeg ------------
-CAP_KINDS = ("video", "audio", "screen", "window", "lavfi")      # lavfi: a synthetic source, used by the tests only
+CAP_KINDS = ("video", "audio", "screen", "window", "lavfi", "output")      # lavfi: a synthetic source, used by the tests only
 _NOWIN = 0x08000000 if sys.platform == "win32" else 0            # CREATE_NO_WINDOW
 _ABOVE_NORMAL = 0x00008000 if sys.platform == "win32" else 0     # ABOVE_NORMAL_PRIORITY_CLASS
 
@@ -2814,6 +2925,8 @@ def cap_label(cap):
         return cap.get("title") or "window"
     if k == "screen":
         return cap.get("device") or "screen"
+    if k == "output":
+        return "Output " + (cap.get("device") or "?")
     return cap.get("device") or k
 
 
@@ -2971,6 +3084,18 @@ def ar_clean(raw):
     else:
         ar["map"] = [[k, k] for k in range(min(ar["n_src"], ar["n_dst"]))]
     return ar
+
+
+def ar_summary(ar, default_dev="System default"):
+    """One line: the device and the device channels with the source channels feeding them (e.g. «Speakers · 2 ch: 1←L  2←R»)."""
+    dev = ar.get("dev_label") or (default_dev if ar.get("dev", "auto") == "auto" else ar.get("dev", ""))
+    ns, nd = ar.get("n_src", 2), ar.get("n_dst", 2)
+    names = AR_SRC_LAYOUTS.get(ns, ("", ()))[1]
+    parts = []
+    for d in range(nd):
+        srcs = sorted(sc for (dd, sc) in map(tuple, ar.get("map", [])) if dd == d and sc < ns)
+        parts.append(f"{d + 1}←" + ("+".join(names[sc] if sc < len(names) else str(sc + 1) for sc in srcs) if srcs else "–"))
+    return f"{dev} · {nd} ch: " + "  ".join(parts)
 
 
 def ar_is_default(ar):
@@ -4300,8 +4425,8 @@ STR = {
         "ndi_quality": "Qualidade NDI", "btn_lock_kb": "🔒 Bloquear teclado", "btn_lock_kb_on": "🔓 Teclado bloqueado",
         "quality_label": "Qualidade", "big_title": "Janela maior", "btn_multiview": "Multiview", "btn_composite": "Output Composto", "btn_sync": "Sync", "sy_title": "Sincronização Main / Backup", "sy_role": "Este computador é:", "sy_host": "IP do Main (só no Backup):", "sy_port": "Porta:", "sy_key": "Chave (igual nos dois):", "sy_fail": "Backup assume após (s):", "sy_start": "Iniciar", "sy_stop": "Parar", "sy_promote": "Promover a Main", "sy_hint": "Os dois computadores têm de estar na mesma rede e ter a mesma chave. Abre as portas TCP da porta escolhida e da seguinte na firewall do Main. A ligação não é cifrada (uso em rede local). No Backup, as ações feitas à mão na reprodução são desfeitas pelo Main; os ecrãs, os dispositivos de áudio e o Multiview/Composto ficam os do próprio Backup.", "sy_st_main": "Main ativo na porta {port}. Backups ligados: {n}", "sy_st_denied": "O Main recusou a ligação: chave errada", "sy_st_conn": "Ligado ao Main {host}", "sy_st_wait": "A ligar ao Main {host}… {err}", "sy_st_applied": "Último show recebido às {t} (vezes: {n})", "sy_st_files": "A copiar ficheiros do Main: {done} / {total} MB ({left} em falta)", "ndi_preview": "Pré-visualização", "ndi_preview_pick": "Clica numa fonte da lista para a ver aqui", "ndi_preview_wait": "A ligar à fonte NDI…", "ndi_preview_err": "Não foi possível receber esta fonte", "ndi_ctx_inputs": "NDI Inputs", "ndi_ctx_none": "(sem fontes NDI na rede)", "ndi_ctx_refresh": "Procurar de novo", "ndi_ctx_window": "Janela de importação…", "sy_st_off": "Sincronização desligada", "sy_st_bk_files": "O Backup está a copiar ficheiros: {done} / {total} MB", "sy_st_sent": "Show enviado (versão {n}, {f} ficheiros)", "sy_st_promoted": "Este computador assumiu como Main", "sy_err_listen": "Sync: não foi possível abrir a porta: {err}", "sy_err_host": "Sync: indica o IP do Main", "sy_promoted": "Backup promovido a Main", "sy_promoted_msg": "O Main deixou de responder. Este computador assumiu como Main e continua a reprodução do ponto em que estava.",  "ar_devices": "Dispositivos de áudio (por sistema)", "ar_pa_missing": "Routing PortAudio: dispositivo ou sounddevice/ffmpeg indisponível (o mpv toca normalmente)", "ar_pa_failed": "Routing PortAudio falhou: {err}", "ar_pa_live": "Motor PortAudio ativo: {n} canais a {r} Hz, latência do dispositivo ~{ms} ms", "ar_pa_idle": "Motor PortAudio: carrega em Aplicar para abrir o dispositivo", "ar_asio_nosd": "precisa de «pip install sounddevice»", "ar_asio_nodrv": "nenhum driver ASIO instalado",  "ar_src_ch": "Canais da fonte:", "ar_dst_ch": "Canais do dispositivo:", "ar_corner": "Dispositivo ↓  /  Fonte →", "ar_ch": "Canal", "ar_default_dev": "Dispositivo por defeito do sistema", "ar_current": "Dispositivo: {dev}", "ar_live": "A tocar: o dispositivo abriu com {n} canais a {r} Hz", "ar_idle": "(o output não está a tocar: o dispositivo ainda não foi aberto)", "ar_na": "indisponível neste libmpv", "ar_identity": "1:1", "ar_spread": "Repetir", "ar_mono_all": "Mono → todos", "ar_clear": "Limpar", "ar_refresh": "Atualizar lista", "ar_hint": "Clica numa célula para ligar um canal da fonte (coluna) a um canal do dispositivo (linha); vários canais no mesmo destino são misturados. A saída NDI não é afetada.",  "co_title": "Output Composto", "co_res": "Resolução", "co_apply": "Aplicar", "co_unite_lbl": "Canvas único:", "co_unite": "Unir outputs", "co_arr_h": "Horizontal", "co_arr_v": "Vertical", "co_arr_g": "Grelha", "co_hint": "Arrasta outputs/inputs para o canvas · pontos azuis = corner pin · canto laranja redimensiona · botão direito remove", "co_crop": "Recorte %", "co_rot": "Rotação", "co_flip_h": "Espelho horizontal", "co_flip_v": "Espelho vertical", "co_fit": "Ajuste da imagem", "co_fit_fit": "Encaixar", "co_fit_stretch": "Esticar", "co_fit_fill": "Preencher", "co_blend": "Edge blend %", "co_l": "Esq", "co_t": "Topo", "co_r": "Dir", "co_b": "Base", "co_pin_reset": "Repor corner pin", "co_remove": "Remover slice", "co_none_sel": "(nenhum slice selecionado)", "st_co_on": "Output Composto ligado", "st_co_no_screen": "Output Composto: escolhe primeiro um ecrã", "co_unite_none": "Não há outputs para unir", "mv_title": "Multiview Output", "mv_screen": "Ecrã", "mv_clear": "Limpar tiles", "yt_press_play_short": "Carrega em ▶ no preview para abrir o vídeo antes de marcar IN/OUT", "yt_press_play": "Carrega em ▶ para abrir o vídeo (barra de tempo e marcadores)", "ytl_title": "Live do YouTube", "ytl_waiting": "A ligar à live…", "mv_quality": "Qualidade dos tiles", "mv_q_auto": "Auto", "mv_hint": "Arrasta outputs/inputs para o ecrã · arrasta o canto laranja para redimensionar · botão direito remove", "mv_outputs": "Outputs", "mv_inputs": "Inputs (lista)", "mv_remove": "Remover tile", "st_mv_taken": "Aviso: este ecrã está a ser usado por {o}", "st_mv_no_screen": "Multiview: escolhe primeiro um ecrã", "st_mv_on": "Multiview ligado",
         "ss_autostart": "Iniciar o slideshow automaticamente ao Play", "ss_apply_close": "Aplicar e fechar", "ctx_ss_start": "Iniciar slideshow", "st_mv_same": "Aviso: este é o ecrã da interface; o Multiview fica por trás da app (duplo clique ou Esc no Multiview desliga-o)",
-        "mv_copy_size": "Copiar tamanho", "mv_paste_size": "Colar tamanho", "mv_copy_pos": "Copiar posição", "mv_paste_pos": "Colar posição",
-        "btn_capture": "Captura", "cap_kind_video": "Dispositivo de vídeo", "cap_kind_audio": "Dispositivo de áudio", "cap_kind_screen": "Captura de ecrã", "cap_kind_window": "Captura de janela", "cap_kind_lavfi": "Fonte de teste", "cap_mi_video": "Dispositivo de vídeo (câmara / placa)…", "cap_mi_audio": "Dispositivo de áudio…", "cap_mi_screen": "Captura de ecrã…", "cap_mi_window": "Captura de janela…", "cap_title": "CAPTURA", "cap_waiting": "A iniciar a captura…", "cap_loading": "A procurar dispositivos…", "cap_none": "Nenhum dispositivo encontrado (a lista usa o ffmpeg e o DirectShow do Windows).", "cap_device": "Dispositivo", "cap_mode": "Modo", "cap_auto": "Automático", "cap_add": "Adicionar", "cap_refresh": "Atualizar", "cap_col_dev": "Dispositivo", "cap_col_ch": "Canais", "cap_col_bits": "Bits", "cap_col_rate": "Frequência", "cap_hint_audio": "Para capturar o som do sistema escolhe «Stereo Mix» ou «virtual-audio-capturer», se existir (Windows → Som → Gravação → mostrar dispositivos desativados).", "cap_screen_all": "Todos os ecrãs", "cap_windows_only": "A captura de ecrã e de janela só funciona no Windows.", "st_cap_added": "Captura «{name}» adicionada",
+        "mv_rotate": "Rodar", "mv_rot_cw": "90° para a direita", "mv_rot_ccw": "90° para a esquerda", "mv_fit_aspect": "Ajustar ao aspeto da fonte", "mv_copy_size": "Copiar tamanho", "mv_paste_size": "Colar tamanho", "mv_copy_pos": "Copiar posição", "mv_paste_pos": "Colar posição",
+        "btn_capture": "Captura", "xf_btn": "Transformar", "xf_title": "Transformação do output", "xf_rot": "Rotação", "xf_sx": "Escala horizontal %", "xf_sy": "Escala vertical %", "xf_link": "Ligar horizontal e vertical", "xf_crop": "Cortar (% da imagem)", "xf_reset": "Repor", "xf_hint": "Aplica-se à imagem final do output (também à saída NDI e ao «Output como Input»). Menos de 100 % deixa margens pretas; mais de 100 % corta o que sai do ecrã. Os cortes escurecem as margens sem mexer no resto. O monitor do output mostra a imagem sem esta transformação.", "cap_kind_output": "Output como Input", "cap_mi_output": "Output como Input…", "oai_title": "Output como Input", "oai_hint": "Escolhe o output cuja imagem (com a transformação aplicada) passa a ser uma entrada da lista. Podes reproduzi-la noutro output ou usá-la no Multiview.", "oai_no_outputs": "Ainda não há outputs. Adiciona um output primeiro.", "oai_off": "desligado", "oai_suffix": "como Input",  "cap_kind_video": "Dispositivo de vídeo", "cap_kind_audio": "Dispositivo de áudio", "cap_kind_screen": "Captura de ecrã", "cap_kind_window": "Captura de janela", "cap_kind_lavfi": "Fonte de teste", "cap_mi_video": "Dispositivo de vídeo (câmara / placa)…", "cap_mi_audio": "Dispositivo de áudio…", "cap_mi_screen": "Captura de ecrã…", "cap_mi_window": "Captura de janela…", "cap_title": "CAPTURA", "cap_waiting": "A iniciar a captura…", "cap_loading": "A procurar dispositivos…", "cap_none": "Nenhum dispositivo encontrado (a lista usa o ffmpeg e o DirectShow do Windows).", "cap_device": "Dispositivo", "cap_mode": "Modo", "cap_auto": "Automático", "cap_add": "Adicionar", "cap_refresh": "Atualizar", "cap_col_dev": "Dispositivo", "cap_col_ch": "Canais", "cap_col_bits": "Bits", "cap_col_rate": "Frequência", "cap_hint_audio": "Para capturar o som do sistema escolhe «Stereo Mix» ou «virtual-audio-capturer», se existir (Windows → Som → Gravação → mostrar dispositivos desativados).", "cap_screen_all": "Todos os ecrãs", "cap_windows_only": "A captura de ecrã e de janela só funciona no Windows.", "st_cap_added": "Captura «{name}» adicionada",
         "cap_apply": "Aplicar", "cap_fps_range": "Este modo só aceita entre {lo} e {hi} fps.", "cap_mouse": "Mostrar o rato", "cap_dev_opts": "Opções do dispositivo…", "cap_preview": "Pré-visualização",
         "cap_prev_wait": "A iniciar a pré-visualização…", "cap_prev_live": "Fonte ativa.", "cap_prev_err": "Erro: {err}", "cap_prev_nolib": "Pré-visualização indisponível (libmpv).",
         "cap_fps_bad": "FPS inválido (use um número entre 1 e 240, ex.: 25 ou 29.97).", "cap_dev_opts_busy": "A abrir as opções do dispositivo…",
@@ -4756,8 +4881,8 @@ STR = {
         "ndi_quality": "NDI quality", "btn_lock_kb": "🔒 Lock keyboard", "btn_lock_kb_on": "🔓 Keyboard locked",
         "quality_label": "Quality", "big_title": "Bigger window", "btn_multiview": "Multiview", "btn_composite": "Composite Output", "btn_sync": "Sync", "sy_title": "Main / Backup synchronisation", "sy_role": "This computer is:", "sy_host": "Main IP (Backup only):", "sy_port": "Port:", "sy_key": "Key (same on both):", "sy_fail": "Backup takes over after (s):", "sy_start": "Start", "sy_stop": "Stop", "sy_promote": "Promote to Main", "sy_hint": "Both computers must be on the same network and use the same key. Allow the chosen TCP port and the next one in the Main's firewall. The link is not encrypted (local network use). On the Backup, playback actions made by hand are undone by the Main; its screens, audio devices and Multiview / Composite stay the Backup's own.", "sy_st_main": "Main active on port {port}. Backups connected: {n}", "sy_st_denied": "The Main refused the connection: wrong key", "sy_st_conn": "Connected to Main {host}", "sy_st_wait": "Connecting to Main {host}… {err}", "sy_st_applied": "Last show received at {t} (times: {n})", "sy_st_files": "Copying files from the Main: {done} / {total} MB ({left} left)", "ndi_preview": "Preview", "ndi_preview_pick": "Click a source in the list to see it here", "ndi_preview_wait": "Connecting to the NDI source…", "ndi_preview_err": "This source could not be received", "ndi_ctx_inputs": "NDI Inputs", "ndi_ctx_none": "(no NDI sources on the network)", "ndi_ctx_refresh": "Search again", "ndi_ctx_window": "Import window…", "sy_st_off": "Synchronisation is off", "sy_st_bk_files": "The Backup is copying files: {done} / {total} MB", "sy_st_sent": "Show sent (version {n}, {f} files)", "sy_st_promoted": "This computer took over as Main", "sy_err_listen": "Sync: could not open the port: {err}", "sy_err_host": "Sync: enter the Main's IP", "sy_promoted": "Backup promoted to Main", "sy_promoted_msg": "The Main stopped answering. This computer took over as Main and keeps playing from where it was.",  "ar_devices": "Audio devices (by system)", "ar_pa_missing": "PortAudio routing: device or sounddevice/ffmpeg unavailable (mpv plays normally)", "ar_pa_failed": "PortAudio routing failed: {err}", "ar_pa_live": "PortAudio engine on: {n} channels at {r} Hz, device latency ~{ms} ms", "ar_pa_idle": "PortAudio engine: press Apply to open the device", "ar_asio_nosd": "needs «pip install sounddevice»", "ar_asio_nodrv": "no ASIO driver installed",  "ar_src_ch": "Source channels:", "ar_dst_ch": "Device channels:", "ar_corner": "Device ↓  /  Source →", "ar_ch": "Channel", "ar_default_dev": "System default device", "ar_current": "Device: {dev}", "ar_live": "Playing: the device opened with {n} channels at {r} Hz", "ar_idle": "(the output is not playing: the device has not been opened yet)", "ar_na": "not available in this libmpv", "ar_identity": "1:1", "ar_spread": "Repeat", "ar_mono_all": "Mono → all", "ar_clear": "Clear", "ar_refresh": "Refresh list", "ar_hint": "Click a cell to connect a source channel (column) to a device channel (row); several channels into one destination are mixed. NDI output is not affected.",  "co_title": "Composite Output", "co_res": "Resolution", "co_apply": "Apply", "co_unite_lbl": "Single canvas:", "co_unite": "Merge outputs", "co_arr_h": "Horizontal", "co_arr_v": "Vertical", "co_arr_g": "Grid", "co_hint": "Drag outputs/inputs onto the canvas · blue dots = corner pin · orange corner resizes · right click removes", "co_crop": "Crop %", "co_rot": "Rotation", "co_flip_h": "Mirror horizontal", "co_flip_v": "Mirror vertical", "co_fit": "Picture fit", "co_fit_fit": "Fit", "co_fit_stretch": "Stretch", "co_fit_fill": "Fill", "co_blend": "Edge blend %", "co_l": "Left", "co_t": "Top", "co_r": "Right", "co_b": "Bottom", "co_pin_reset": "Reset corner pin", "co_remove": "Remove slice", "co_none_sel": "(no slice selected)", "st_co_on": "Composite output on", "st_co_no_screen": "Composite output: pick a screen first", "co_unite_none": "No outputs to merge", "mv_title": "Multiview Output", "mv_screen": "Screen", "mv_clear": "Clear tiles", "yt_press_play_short": "Press ▶ in the preview to open the video before setting IN / OUT", "yt_press_play": "Press ▶ to open the video (time bar and markers)", "ytl_title": "YouTube live", "ytl_waiting": "Connecting to the live stream…", "mv_quality": "Tile quality", "mv_q_auto": "Auto", "mv_hint": "Drag outputs/inputs onto the screen · drag the orange corner to resize · right click removes", "mv_outputs": "Outputs", "mv_inputs": "Inputs (list)", "mv_remove": "Remove tile", "st_mv_taken": "Warning: this screen is used by {o}", "st_mv_no_screen": "Multiview: pick a screen first", "st_mv_on": "Multiview on",
         "ss_autostart": "Auto-start Slideshow when Play", "ss_apply_close": "Apply and Close", "ctx_ss_start": "Start slideshow", "st_mv_same": "Warning: this is the app's own screen; the Multiview sits behind the app (double-click or Esc on the Multiview turns it off)",
-        "mv_copy_size": "Copy size", "mv_paste_size": "Paste size", "mv_copy_pos": "Copy position", "mv_paste_pos": "Paste position",
-        "btn_capture": "Capture", "cap_kind_video": "Video device", "cap_kind_audio": "Audio device", "cap_kind_screen": "Screen capture", "cap_kind_window": "Window capture", "cap_kind_lavfi": "Test source", "cap_mi_video": "Video device (camera / card)…", "cap_mi_audio": "Audio device…", "cap_mi_screen": "Screen capture…", "cap_mi_window": "Window capture…", "cap_title": "CAPTURE", "cap_waiting": "Starting the capture…", "cap_loading": "Looking for devices…", "cap_none": "No device found (the list uses ffmpeg and Windows DirectShow).", "cap_device": "Device", "cap_mode": "Mode", "cap_auto": "Automatic", "cap_add": "Add", "cap_refresh": "Refresh", "cap_col_dev": "Device", "cap_col_ch": "Channels", "cap_col_bits": "Bits", "cap_col_rate": "Sample rate", "cap_hint_audio": "To capture the system sound pick «Stereo Mix» or «virtual-audio-capturer» if it exists (Windows → Sound → Recording → show disabled devices).", "cap_screen_all": "All screens", "cap_windows_only": "Screen and window capture only work on Windows.", "st_cap_added": "Capture «{name}» added",
+        "mv_rotate": "Rotate", "mv_rot_cw": "90° clockwise", "mv_rot_ccw": "90° anticlockwise", "mv_fit_aspect": "Fit to source aspect", "mv_copy_size": "Copy size", "mv_paste_size": "Paste size", "mv_copy_pos": "Copy position", "mv_paste_pos": "Paste position",
+        "btn_capture": "Capture", "xf_btn": "Transform", "xf_title": "Output transform", "xf_rot": "Rotation", "xf_sx": "Horizontal scale %", "xf_sy": "Vertical scale %", "xf_link": "Link horizontal and vertical", "xf_crop": "Cut (% of the picture)", "xf_reset": "Reset", "xf_hint": "Applies to the final picture of the output (also to the NDI output and to «Output as Input»). Under 100 % leaves black margins; over 100 % cuts what leaves the screen. Cuts black out the edges without moving the rest. The output monitor shows the picture without this transform.", "cap_kind_output": "Output as Input", "cap_mi_output": "Output as Input…", "oai_title": "Output as Input", "oai_hint": "Pick the output whose picture (transform included) becomes an input in the list. Play it on another output or use it in the Multiview.", "oai_no_outputs": "There are no outputs yet. Add an output first.", "oai_off": "off", "oai_suffix": "as Input",  "cap_kind_video": "Video device", "cap_kind_audio": "Audio device", "cap_kind_screen": "Screen capture", "cap_kind_window": "Window capture", "cap_kind_lavfi": "Test source", "cap_mi_video": "Video device (camera / card)…", "cap_mi_audio": "Audio device…", "cap_mi_screen": "Screen capture…", "cap_mi_window": "Window capture…", "cap_title": "CAPTURE", "cap_waiting": "Starting the capture…", "cap_loading": "Looking for devices…", "cap_none": "No device found (the list uses ffmpeg and Windows DirectShow).", "cap_device": "Device", "cap_mode": "Mode", "cap_auto": "Automatic", "cap_add": "Add", "cap_refresh": "Refresh", "cap_col_dev": "Device", "cap_col_ch": "Channels", "cap_col_bits": "Bits", "cap_col_rate": "Sample rate", "cap_hint_audio": "To capture the system sound pick «Stereo Mix» or «virtual-audio-capturer» if it exists (Windows → Sound → Recording → show disabled devices).", "cap_screen_all": "All screens", "cap_windows_only": "Screen and window capture only work on Windows.", "st_cap_added": "Capture «{name}» added",
         "cap_apply": "Apply", "cap_fps_range": "This mode only accepts {lo} to {hi} fps.", "cap_mouse": "Show mouse", "cap_dev_opts": "Device options…", "cap_preview": "Preview",
         "cap_prev_wait": "Starting the preview…", "cap_prev_live": "Source is live.", "cap_prev_err": "Error: {err}", "cap_prev_nolib": "Preview unavailable (libmpv).",
         "cap_fps_bad": "Invalid FPS (use a number between 1 and 240, e.g. 25 or 29.97).", "cap_dev_opts_busy": "Opening the device options…",
@@ -5097,7 +5222,75 @@ def parse_fps(text):
         return None
     return v if 0 < v <= 240 else None
 
-def build_vf(canvas, mode, fps, div=1):
+# ---- output transform: rotation, horizontal / vertical scale and edge cut applied to the finished picture of an output -------
+def xf_default():
+    return {"rot": 0, "sx": 100.0, "sy": 100.0, "l": 0.0, "t": 0.0, "r": 0.0, "b": 0.0}
+
+
+def xf_clean(raw):
+    xf = xf_default()
+    if not isinstance(raw, dict):
+        return xf
+    def f(k, lo, hi):
+        v = raw.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v:
+            xf[k] = float(max(lo, min(hi, v)))
+    f("sx", 10, 400)
+    f("sy", 10, 400)
+    for k in ("l", "t", "r", "b"):
+        f(k, 0, 90)
+    if xf["l"] + xf["r"] > 95:
+        xf["l"] = xf["r"] = 0.0
+    if xf["t"] + xf["b"] > 95:
+        xf["t"] = xf["b"] = 0.0
+    rot = raw.get("rot")
+    xf["rot"] = rot if rot in (0, 90, 180, 270) else 0
+    return xf
+
+
+def xf_is_default(xf):
+    return not xf or xf == xf_default()
+
+
+def xf_filters(xf, size=None):
+    """lavfi filters (list) applying the transform to a picture of `size` (w, h) - or any size when None. Order: rotate, scale about
+    the centre (the picture keeps its size: a smaller one gets black borders, a bigger one is cut), then edges blacked out.
+    Expressions contain no commas, so the chain can be joined with ','."""
+    if xf_is_default(xf):
+        return []
+    f = []
+    w, h = size if size else (None, None)
+    rot = xf.get("rot", 0)
+    if rot == 90:
+        f.append("transpose=1")
+        w, h = (h, w) if size else (None, None)
+    elif rot == 270:
+        f.append("transpose=2")
+        w, h = (h, w) if size else (None, None)
+    elif rot == 180:
+        f += ["hflip", "vflip"]
+    sx, sy = xf.get("sx", 100) / 100.0, xf.get("sy", 100) / 100.0
+    if abs(sx - 1) > 1e-6 or abs(sy - 1) > 1e-6:
+        f.append(f"scale=w=trunc(iw*{sx:.5f}/2)*2:h=trunc(ih*{sy:.5f}/2)*2:flags=bilinear")
+        tw = f"{w}" if w else f"trunc(iw/{sx:.5f}/2)*2"
+        th = f"{h}" if h else f"trunc(ih/{sy:.5f}/2)*2"
+        if sx > 1:
+            f.append(f"crop=w={tw}:h=ih:x=(iw-ow)/2:y=0")
+        elif sx < 1:
+            f.append(f"pad=w={tw}:h=ih:x=(ow-iw)/2:y=0:color=black")
+        if sy > 1:
+            f.append(f"crop=w=iw:h={th}:x=0:y=(ih-oh)/2")
+        elif sy < 1:
+            f.append(f"pad=w=iw:h={th}:x=0:y=(oh-ih)/2:color=black")
+    L, T, R, B = (xf.get(k, 0) / 100.0 for k in ("l", "t", "r", "b"))
+    if L or T or R or B:
+        kx, ky = 1 - L - R, 1 - T - B
+        f.append(f"crop=w=trunc(iw*{kx:.5f}/2)*2:h=trunc(ih*{ky:.5f}/2)*2:x=trunc(iw*{L:.5f}/2)*2:y=trunc(ih*{T:.5f}/2)*2")
+        f.append(f"pad=w=trunc(iw/{kx:.5f}/2)*2:h=trunc(ih/{ky:.5f}/2)*2:x=trunc(iw/{kx:.5f}*{L:.5f}/2)*2:y=trunc(ih/{ky:.5f}*{T:.5f}/2)*2:color=black")
+    return f
+
+
+def build_vf(canvas, mode, fps, div=1, xf=None):
     """mpv --vf string for an output.
 
     The chosen resolution is a CANVAS (square pixels, W:H aspect). The item's aspect mode decides how
@@ -5129,6 +5322,8 @@ def build_vf(canvas, mode, fps, div=1):
         f.append("setsar=1")
     elif div > 1:                                                          # «Original» resolution at 1/2, 1/4 quality
         f += [f"scale=w=trunc(iw*sar/{div}/2)*2:h=trunc(ih/{div}/2)*2", "setsar=1"]
+    if not xf_is_default(xf):
+        f += xf_filters(xf, canvas)
     if fps:
         f.append(f"fps={fps:g}:round=near")
     return f"lavfi=[{','.join(f)}]" if f else ""
@@ -5747,6 +5942,7 @@ class Output:
         self.panel = None
         self.vol = tk.IntVar(value=80)
         self._sig = {}              # last format applied per player ("m" / "pv")
+        self.xf = xf_default()      # transform of the picture: rotation, horizontal / vertical scale, edge cut
         self._windowed = False      # user left fullscreen on purpose (key F)
         self._fade_f = 1.0          # current fade factor (1 = no fade)
         self._headless = False      # running without a window (Screen = None) because NDI output is on
@@ -7056,7 +7252,8 @@ class App:
         canvas = self._ndi_canvas(out)                    # resolution / quality
         div = self._q_div(out)
         fvar = getattr(out, "fps_var", None)
-        vf = build_vf(canvas, mode, parse_fps(fvar.get()) if fvar is not None else None, div if not self._canvas(out) else 1)
+        vf = build_vf(canvas, mode, parse_fps(fvar.get()) if fvar is not None else None, div if not self._canvas(out) else 1,
+                      xf=getattr(out, "xf", None))
         sig = (vf, bool(canvas), mode)
         for role, player in (("m", out.m), ("pv", out.pv)):
             if not player:
@@ -7297,18 +7494,82 @@ class App:
 
     def _mv_add_tile(self, kind, ref, fx, fy):
         mv = self._mvs()
-        sw, sh = self._mv_screen_size()
-        w = 0.3
-        h = min(0.9, w * (sw / sh) * 9 / 16 / (1 - self.MV_LBL))
         mv["uid"] += 1
-        t = {"uid": mv["uid"], "kind": kind, "ref": ref, "x": max(0.0, min(1 - w, fx - w / 2)),
-             "y": max(0.0, min(1 - h, fy - h / 2)), "w": w, "h": h}
+        t = {"uid": mv["uid"], "kind": kind, "ref": ref, "x": 0.0, "y": 0.0, "w": 0.3, "h": 0.3, "rot": 0, "asp": None}
+        t["h"] = self._mv_h_for_w(t, t["w"])
+        if t["h"] > 0.9:
+            t["h"] = 0.9
+            t["w"] = self._mv_w_for_h(t, t["h"])
+        t["x"], t["y"] = max(0.0, min(1 - t["w"], fx - t["w"] / 2)), max(0.0, min(1 - t["h"], fy - t["h"] / 2))
         mv["tiles"].append(t)
         mv["sel"] = t["uid"]
         if mv["on"]:
             self._mv_build_tile(t)
         self._mv_redraw_editor()
         return t
+
+    # -- tile size follows the aspect of its source (rotation swaps it)
+    def _mv_base_aspect(self, t):
+        """Width / height of the source picture (before the tile's own rotation): what the player reported, else the output's canvas / screen."""
+        a = t.get("asp")
+        if isinstance(a, (int, float)) and 0.1 < a < 10:
+            return float(a)
+        if t.get("kind") == "out":
+            o = next((o for o in self.outs if o.num == t["ref"]), None)
+            if o is not None:
+                c = self._canvas(o)
+                if c:
+                    return c[0] / c[1]
+                if o.sel_geo:
+                    return o.sel_geo[2] / max(1, o.sel_geo[3])
+        return 16 / 9
+
+    def _mv_aspect(self, t):
+        a = self._mv_base_aspect(t)
+        return 1 / a if t.get("rot", 0) in (90, 270) else a
+
+    def _mv_h_for_w(self, t, w):
+        """Tile height (fraction of the screen) whose picture area has the source aspect for the tile width `w`."""
+        sw, sh = self._mv_screen_size()
+        q = max(8.0, w * sw - 6) / self._mv_aspect(t) + 6           # picture height + the 3 px frame on each side
+        ph = q / (1 - self.MV_LBL)
+        if ph * self.MV_LBL < 40:                                   # small tile: the name strip has a 40 px minimum
+            ph = q + 40
+        return ph / sh
+
+    def _mv_w_for_h(self, t, h):
+        sw, sh = self._mv_screen_size()
+        ph = h * sh
+        lbl = max(40.0, ph * self.MV_LBL)
+        pic_h = max(8.0, ph - lbl - 6)
+        return (pic_h * self._mv_aspect(t) + 6) / sw
+
+    def _mv_fit_tile(self, t, keep="w"):
+        """Resize a tile to its source aspect (keeping its width or its height) and back inside the screen."""
+        if keep == "w":
+            t["h"] = self._mv_h_for_w(t, t["w"])
+        else:
+            t["w"] = self._mv_w_for_h(t, t["h"])
+        k = min(1.0, 1.0 / max(t["w"], 1e-6), 1.0 / max(t["h"], 1e-6))
+        if k < 1:
+            t["w"], t["h"] = t["w"] * k, t["h"] * k
+        t["w"], t["h"] = max(0.06, t["w"]), max(0.06, t["h"])
+        t["x"] = max(0.0, min(1 - t["w"], t["x"]))
+        t["y"] = max(0.0, min(1 - t["h"], t["y"]))
+
+    def _mv_set_rot(self, t, rot):
+        if t.get("rot", 0) == rot:
+            return
+        cx, cy = t["x"] + t["w"] / 2, t["y"] + t["h"] / 2
+        swap = (t.get("rot", 0) in (90, 270)) != (rot in (90, 270))
+        t["rot"] = rot
+        if swap:                                                    # the picture turns: width and height trade places (same centre)
+            t["w"], t["h"] = self._mv_w_for_h(t, t["h"]), t["h"]
+            t["x"], t["y"] = cx - t["w"] / 2, cy - t["h"] / 2
+        self._mv_fit_tile(t, "w")
+        if self._mvs()["on"]:
+            self._mv_place_tile(t)
+        self._mv_redraw_editor()
 
     def _mv_remove_tile(self, t):
         mv = self._mvs()
@@ -7536,7 +7797,7 @@ class App:
             else:
                 it = next((i for i in self.items if i["id"] == t["ref"]), None)
                 sub = self._out_name(it["output"]) if it else "?"
-            cv.create_text((x0 + x1) / 2, (y0 + ly) / 2, text=("▶ " if t["kind"] == "in" else "▣ ") + self._mv_source_name(t),
+            cv.create_text((x0 + x1) / 2, (y0 + ly) / 2, text=("▶ " if t["kind"] == "in" else "▣ ") + self._mv_source_name(t) + (f"  ↻{t['rot']}°" if t.get("rot") else ""),
                            fill="#cfd8e3", width=max(20, x1 - x0 - 10), font=("Segoe UI", 9))
             cv.create_text((x0 + x1) / 2, (ly + y1) / 2, text=sub, fill="white", font=("Segoe UI", 7))
             cv.create_rectangle(x1 - 10, y1 - 10, x1, y1, fill="#ff8a3d", outline="")
@@ -7576,9 +7837,15 @@ class App:
         if d["mode"] == "move":
             t["x"] = max(0.0, min(1 - t["w"], d["ox"] + dx))
             t["y"] = max(0.0, min(1 - t["h"], d["oy"] + dy))
-        else:
-            t["w"] = max(0.06, min(1 - t["x"], d["ow"] + dx))
-            t["h"] = max(0.06, min(1 - t["y"], d["oh"] + dy))
+        else:                                                       # the picture keeps the aspect of its source (rotation included)
+            w1 = max(0.06, d["ow"] + dx)
+            w2 = self._mv_w_for_h(t, max(0.06, d["oh"] + dy))
+            t["w"] = max(w1, w2) if (dx >= 0 or dy >= 0) else min(w1, w2)
+            self._mv_fit_tile(t, "w")
+            t["x"], t["y"] = d["ox"], d["oy"]
+            k = min(1.0, (1 - t["x"]) / t["w"], (1 - t["y"]) / t["h"])
+            if k < 1:                                               # would leave the screen: smaller, same aspect
+                t["w"], t["h"] = t["w"] * k, t["h"] * k
         self._mv_redraw_editor()
 
     def _mv_cv_release(self, _e):
@@ -7626,6 +7893,16 @@ class App:
         menu.add_command(label=self.t("mv_copy_pos"), command=lambda: self._mv_copy_pos(t))
         menu.add_command(label=self.t("mv_paste_pos"), command=lambda: self._mv_paste_pos(t),
                          state="normal" if pclip else "disabled")
+        menu.add_separator()
+        rot_menu = self._make_menu(menu)
+        for deg in (0, 90, 180, 270):
+            rot_menu.add_command(label=("✓ " if t.get("rot", 0) == deg else "    ") + f"{deg}°", command=lambda d=deg: self._mv_set_rot(t, d))
+        rot_menu.add_separator()
+        rot_menu.add_command(label=self.t("mv_rot_cw"), command=lambda: self._mv_set_rot(t, (t.get("rot", 0) + 90) % 360))
+        rot_menu.add_command(label=self.t("mv_rot_ccw"), command=lambda: self._mv_set_rot(t, (t.get("rot", 0) - 90) % 360))
+        menu.add_cascade(label=self.t("mv_rotate"), menu=rot_menu)
+        menu.add_command(label=self.t("mv_fit_aspect"), command=lambda: (self._mv_fit_tile(t, "w"), self._mv_place_tile(t) if self._mvs()["on"] else None,
+                                                                         self._mv_redraw_editor()))
         menu.add_separator()
         menu.add_command(label=self.t("mv_remove"), command=lambda: self._mv_remove_tile(t))
         self._popup(menu, e)
@@ -8167,6 +8444,8 @@ class App:
         pv = tile.pv
         if pv is None:
             return
+        if getattr(self, "_mv_ctx", None) != "co":                  # the composite output rotates inside its own filter graph
+            self._mv_tile_view(t, rt, pv)
         if (t["kind"] == "in" and cur is not None and (cur.get("is_slideshow") or is_ytlive(cur) or not is_live(cur))
                 and not any(self._cur_item(o) is cur and o.m is not None for o in self.outs)):
             self._mv_thumb_tile(rt, cur, pv)                        # not playing on an output: a still picture, nothing is started
@@ -8228,6 +8507,30 @@ class App:
                 self._setp(pv, "loop_file", "inf")
         elif follow:
             self._sync_preview(tile, pos, paused)
+
+    def _mv_tile_view(self, t, rt, pv):
+        """Rotation of a Multiview tile (display rotation of its player) and learning the real aspect of its source."""
+        rot = t.get("rot", 0)
+        if rt.get("rot_set") != rot or rt.get("rot_item") is not rt.get("item"):
+            rt["rot_set"], rt["rot_item"] = rot, rt.get("item")
+            self._setp(pv, "video_rotate", rot)
+        now = time.time()
+        if now - rt.get("asp_t", 0) < 1.0:
+            return
+        rt["asp_t"] = now
+        try:
+            vp = pv.video_params
+        except SHUTDOWN:
+            raise
+        except Exception:
+            vp = None
+        if isinstance(vp, dict) and vp.get("w") and vp.get("h"):
+            a = vp.get("aspect") or (vp["w"] * (vp.get("par") or 1)) / vp["h"]
+            if 0.1 < a < 10 and (not t.get("asp") or abs(a / t["asp"] - 1) > 0.01):
+                t["asp"] = float(a)                                 # the tile follows the real aspect of what it shows
+                self._mv_fit_tile(t, "w")
+                self._mv_place_tile(t)
+                self._mv_redraw_editor()
 
     def _mv_thumb_tile(self, rt, cur, pv):
         """Slideshow / live YouTube that no output plays: its thumbnail (first slide / video thumbnail) instead of starting it."""
@@ -8297,7 +8600,9 @@ class App:
             ref = t["ref"] if t["kind"] == "out" else idx.get(t["ref"])
             if ref is None:
                 continue
-            tiles.append({"kind": t["kind"], "ref": ref, **{k: round(t[k], 4) for k in ("x", "y", "w", "h")}})
+            tiles.append({"kind": t["kind"], "ref": ref, **{k: round(t[k], 4) for k in ("x", "y", "w", "h")},
+                          "rot": t.get("rot", 0) if t.get("rot", 0) in (0, 90, 180, 270) else 0,
+                          "asp": round(t["asp"], 4) if isinstance(t.get("asp"), (int, float)) else None})
         return {"geo": list(mv["geo"]) if mv["geo"] else None, "tiles": tiles, "quality": mv.get("q", "auto")}
 
     def _mv_load(self, raw):
@@ -8327,6 +8632,9 @@ class App:
             vals = {k: num(r.get(k), 0.1, 0.0, 1.0) for k in ("x", "y", "w", "h")}
             vals["w"], vals["h"] = max(0.06, vals["w"]), max(0.06, vals["h"])
             mv["uid"] += 1
+            vals["rot"] = r.get("rot") if r.get("rot") in (0, 90, 180, 270) else 0
+            a = r.get("asp")
+            vals["asp"] = float(a) if isinstance(a, (int, float)) and not isinstance(a, bool) and 0.1 < a < 10 else None
             mv["tiles"].append({"uid": mv["uid"], "kind": r["kind"], "ref": ref, **vals})
         self._mv_fill_lists()
         self._mv_fill_pick()
@@ -11094,8 +11402,8 @@ class App:
     def _ffmpeg_path(self):
         if not self._ffmpeg:
             exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
-            local = os.path.join(os.path.dirname(os.path.abspath(__file__)), exe)
-            self._ffmpeg = local if os.path.isfile(local) else (shutil.which("ffmpeg") or "")
+            cands = [os.path.join(os.path.dirname(os.path.abspath(__file__)), exe), os.path.join(os.path.dirname(sys.executable), exe)]
+            self._ffmpeg = next((c for c in cands if os.path.isfile(c)), "") or (shutil.which("ffmpeg") or "")
         return self._ffmpeg
 
     def _lan_ip(self):
@@ -11227,7 +11535,24 @@ class App:
             cap = cap_clean(it.get("cap"))
             if cap is None:
                 return
-            listener = CaptureSource(ff, cap, free_udp_ports(UDP_PORTS), notify)
+            if cap["kind"] == "output":
+                if np is None:
+                    self.status_t("ndi_out_missing")                   # numpy (pip install numpy) is what reads the output's frames
+                    return
+                n = int(cap["device"]) if str(cap.get("device") or "").isdigit() else 0
+                def player_fn(n=n):
+                    o = next((o for o in self.outs if o.num == n), None)
+                    return o.m if o is not None else None
+                def size_fn(n=n):
+                    o = next((o for o in self.outs if o.num == n), None)
+                    return self._ndi_canvas(o) if o is not None else None
+                def fps_fn(n=n):
+                    o = next((o for o in self.outs if o.num == n), None)
+                    return parse_fps(o.fps_var.get()) if o is not None and getattr(o, "fps_var", None) is not None else None
+                listener = OutputSource(ff, player_fn, size_fn, fps_fn, free_udp_ports(UDP_PORTS), notify, name=f"output {n}")
+                self._oai_tick_start()
+            else:
+                listener = CaptureSource(ff, cap, free_udp_ports(UDP_PORTS), notify)
         elif is_ytlive(it):
             args, path = self._yt_args(), it["path"]
             def resolve(i=it, a=args, pa=path):
@@ -11266,6 +11591,77 @@ class App:
         self.tree.see(it["id"])
         self.status_t("st_cap_added", name=it["name"])
         return it
+
+    def _oai_tick_start(self):
+        if self.__dict__.get("_oai_ticking"):
+            return
+        self._oai_ticking = True
+        self._oai_tick()
+
+    def _oai_tick(self):
+        """Keeps the fps / canvas of the sources of «Output as Input» items up to date (Tk values, main thread only)."""
+        if self._closing:
+            return
+        srcs = [l for l in self._rtmp.values() if isinstance(l, OutputSource)]
+        for l in srcs:
+            try:
+                l.refresh()
+            except SHUTDOWN:
+                raise
+            except Exception:
+                pass
+        if srcs:
+            self.root.after(1000, self._oai_tick)
+        else:
+            self._oai_ticking = False
+
+    def add_output_input(self, item=None):
+        """Import > Capture > Output as Input: pick the output(s) whose picture becomes an input (Options of the item: pick another one)."""
+        if not self._ffmpeg_path():
+            messagebox.showerror(self.t("btn_capture"), self.t("rtmp_no_ffmpeg"), parent=self.root)
+            return
+        if not self.outs:
+            messagebox.showinfo(self.t("oai_title"), self.t("oai_no_outputs"), parent=self.root)
+            return
+        theme = THEMES[self.theme_name]
+        win = tk.Toplevel(self.root)
+        win.title(self.t("oai_title"))
+        win.configure(bg=theme["BG"])
+        win.transient(self.root)
+        win.geometry("380x330")
+        ttk.Label(win, text=self.t("oai_hint"), padding=(14, 12, 14, 4), wraplength=350).pack(anchor="w")
+        lb = tk.Listbox(win, selectmode="browse" if item else "extended", activestyle="none", exportselection=False, height=8,
+                        bg=theme["PANEL"], fg=theme["FG"], selectbackground=theme["ACCENT"], selectforeground="white",
+                        highlightthickness=1, highlightbackground=theme["LINE"], relief="flat")
+        lb.pack(fill="both", expand=True, padx=14, pady=4)
+        outs = sorted(self.outs, key=lambda o: o.num)
+        cur = int((item.get("cap") or {}).get("device") or 0) if item else None
+        for o in outs:
+            lb.insert("end", f"{o.name}" + ("   ✓" if o.num == cur else "") + ("" if o.m is not None else "   (" + self.t("oai_off") + ")"))
+        if item and cur is not None:
+            for k, o in enumerate(outs):
+                if o.num == cur:
+                    lb.selection_set(k)
+
+        def go(_e=None):
+            sel = [outs[k] for k in lb.curselection()]
+            if not sel:
+                return
+            if item:
+                cap = dict(item.get("cap") or {}, kind="output", device=str(sel[0].num))
+                self._cap_apply(item, cap)
+                it_name = f"{sel[0].name} ({self.t('oai_suffix')})"
+                item["name"] = it_name[:80]
+                self._refresh_row(item)
+            else:
+                for o in sel:
+                    self._cap_add_item({"kind": "output", "device": str(o.num)}, f"{o.name} ({self.t('oai_suffix')})")
+            win.destroy()
+        lb.bind("<Double-Button-1>", go)
+        bar = ttk.Frame(win, padding=(14, 6, 14, 12))
+        bar.pack(fill="x")
+        ttk.Button(bar, text=self.t("btn_apply_close") if item else self.t("ndi_btn_import"), command=go, takefocus=False).pack(side="right")
+        ttk.Button(bar, text=self.t("ndi_btn_close"), command=win.destroy, takefocus=False).pack(side="right", padx=(0, 6))
 
     def _cap_describe(self, it):
         cap = it.get("cap") or {}
@@ -13299,6 +13695,7 @@ class App:
         cap.add_separator()
         cap.add_command(label=self.t("btn_rtmp"), command=self.add_rtmp)
         cap.add_command(label=self.t("btn_ndi"), command=self.add_ndi)
+        cap.add_command(label=self.t("cap_mi_output"), command=self.add_output_input)
         menu.add_cascade(label=self.t("btn_capture"), menu=cap)
         menu.add_separator()
         menu.add_command(label=self.t("btn_slideshow"), command=self.add_slideshow)
@@ -13606,7 +14003,7 @@ class App:
                 fb = (f"bestvideo{hf}[vcodec!^=av01]+bestaudio/best{hf}[vcodec!^=av01]/"
                       f"bestvideo{hf}+bestaudio/best{hf}/best")
                 for f, meta_on in ((fmt, True), (fmt, False), (fb, False)):
-                    cmd = ([exe] if exe else [sys.executable, "-m", "yt_dlp"]) + ["-g", "--no-playlist", "--no-warnings", "-f", f] \
+                    cmd = ([exe] if exe else YT_DLP_SELF) + ["-g", "--no-playlist", "--no-warnings", "-f", f] \
                         + (["--print", "%(vcodec)s|%(height)s|%(fps)s|%(format_id)s"] if meta_on else []) \
                         + cookie_args + extra_args + [path]
                     r = subprocess.run(cmd, capture_output=True, text=True, timeout=90, encoding="utf-8", errors="replace",
@@ -13703,7 +14100,7 @@ class App:
                 # last resort for the NDI feed: yt-dlp downloads the video stream itself (its own headers / chunking) into ffmpeg
                 exe, ca, xa = self._yt_args()
                 vfmt = (self._yt_fmt_for(item, "out").split("+")[0] or "bestvideo") + "/bestvideo/best"
-                ytcmd = ([exe] if exe else [sys.executable, "-m", "yt_dlp"]) + ["-q", "--no-warnings", "--no-playlist", "-f", vfmt, "-o", "-"] + ca + xa + [path]
+                ytcmd = ([exe] if exe else YT_DLP_SELF) + ["-q", "--no-warnings", "--no-playlist", "-f", vfmt, "-o", "-"] + ca + xa + [path]
             return dict(ytcmd=ytcmd, path=path, src=src, ua=ua, pos=pos, paused=paused and not live, vf=vf, canvas=canvas, fps=fps,
                         t=time.time(), ffmpeg=ff, ffprobe=ffprobe_path(ff), key=(path, vf, canvas, fps, src, div), live=live, image=image, udp=udp, div=div)
         except SHUTDOWN:
@@ -15389,6 +15786,8 @@ class App:
         if len(chosen) == 1 and chosen[0].get("is_capture") and (chosen[0].get("cap") or {}).get("kind") in ("video", "audio", "screen", "window"):
             menu.add_command(label=self.t("ctx_options"),
                              command=lambda it=chosen[0]: self.open_capture_dialog(it["cap"]["kind"], it))
+        if len(chosen) == 1 and chosen[0].get("is_capture") and (chosen[0].get("cap") or {}).get("kind") == "output":
+            menu.add_command(label=self.t("ctx_options"), command=lambda it=chosen[0]: self.add_output_input(it))
         if len(chosen) == 1 and chosen[0].get("is_ndi"):
             menu.add_command(label=self.t("ctx_options"), command=lambda it=chosen[0]: self.add_ndi(it))
         if NDI.available:
@@ -15973,7 +16372,16 @@ class App:
     def _sync_outputs_same(self, data):
         def sig(o):
             return (o.get("num"), o.get("name"), o.get("resolution"), o.get("fps"), bool(o.get("ndi")), o.get("ndi_quality"))
-        return [sig(o) for o in self._outputs_data()] == [sig(o) for o in data.get("outputs", []) if isinstance(o, dict)]
+        mine = self._outputs_data()
+        theirs = [o for o in data.get("outputs", []) if isinstance(o, dict)]
+        same = [sig(o) for o in mine] == [sig(o) for o in theirs]
+        if same:                                                     # a changed transform is applied in place (nothing is rebuilt)
+            for lo, od in zip(self.outs, theirs):
+                xf = xf_clean(od.get("transform"))
+                if xf != getattr(lo, "xf", None):
+                    lo.xf = xf
+                    self._xf_changed(lo)
+        return same
 
     def _apply_playlist_data(self, data, base, path, keep=False):
         """Builds the list (and outputs, Multiview, Composite) from show data. path=None: a show received from the Main (nothing is saved);
@@ -16366,8 +16774,18 @@ class App:
         except Exception:
             return {}
 
+    def _ar_info_update(self, out):
+        lbl = getattr(out, "audio_lbl", None)
+        if lbl is None:
+            return
+        try:
+            lbl.configure(text="🔊 " + ar_summary(out.ar, self.t("ar_default_dev")))
+        except tk.TclError:
+            pass
+
     def _audio_apply(self, out):
         """Sends the output's routing (device, channel count, matrix) to its mpv."""
+        self._ar_info_update(out)
         m = out.m
         if m is None:
             return
@@ -16940,6 +17358,9 @@ class App:
         out.pick_menu.configure(postcommand=lambda o=out: self._fill_pick_menu(o))
         out.pick_btn["menu"] = out.pick_menu
         out.pick_btn.pack(side="left")
+        out.xf_btn = ttk.Button(sel, text="⤢", style="Close.TButton", takefocus=False, width=3,
+                                command=lambda o=out: self.open_output_transform(o))
+        out.xf_btn.pack(side="left", padx=(4, 0))
         out.btn = ttk.Button(sel, style="Accent.TButton", takefocus=False, width=8,
                              command=lambda o=out: self.toggle_output(o))
         out.btn.pack(side="left", padx=(6, 0))
@@ -16947,6 +17368,10 @@ class App:
         out.dot.pack(side="left", padx=(6, 0))
         ttk.Button(sel, text="✕", style="Close.TButton", takefocus=False, width=2,
                    command=lambda o=out: self.remove_output(o)).pack(side="left", padx=(8, 0))
+        out.audio_lbl = ttk.Label(col, text="", style="Hint.TLabel", wraplength=PV_W, cursor="hand2", justify="left")
+        out.audio_lbl.pack(fill="x", pady=(0, 4))
+        out.audio_lbl.bind("<Button-1>", lambda e, o=out: self._open_audio_routing(o))
+        self._ar_info_update(out)
         self._set_output_ui(out)
 
         row = ttk.Frame(col, style="Panel.TFrame")
@@ -17060,6 +17485,111 @@ class App:
 
         self._btn(volf, "btn_audio_routing", lambda o=out: self._open_audio_routing(o), "Small.TButton").pack(pady=(4, 0))
 
+    def _xf_changed(self, out):
+        """The transform of an output changed: the output window is re-filtered (the NDI output follows it) and the button shows it."""
+        try:
+            if getattr(out, "xf_btn", None) is not None:
+                out.xf_btn.configure(text="⤢" if xf_is_default(out.xf) else "⤢•")
+        except tk.TclError:
+            pass
+        out._sig.pop("m", None)
+        try:
+            self._apply_output_format(out)
+        except SHUTDOWN:
+            raise
+        except Exception:
+            pass
+
+    def open_output_transform(self, out):
+        """Window with rotation, horizontal / vertical scale and cut (top, bottom, left, right) of an output's picture."""
+        wins = self.__dict__.setdefault("_xf_wins", {})
+        old = wins.get(out.num)
+        try:
+            if old is not None and old.winfo_exists():
+                old.lift()
+                return
+        except tk.TclError:
+            pass
+        theme = THEMES[self.theme_name]
+        win = tk.Toplevel(self.root)
+        wins[out.num] = win
+        win.title(f"{out.name} — {self.t('xf_title')}")
+        win.configure(bg=theme["BG"])
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        vars_ = {}
+        busy = {"on": False, "job": None}
+
+        def push(*_a):
+            if busy["on"]:
+                return
+            try:
+                xf = xf_clean({k: v.get() for k, v in vars_.items()})
+            except tk.TclError:                                    # a box that is empty / being typed in
+                return
+            if xf == out.xf:
+                return
+            out.xf = xf
+            if busy["job"] is not None:
+                win.after_cancel(busy["job"])
+            busy["job"] = win.after(120, lambda: (busy.update(job=None), self._xf_changed(out)))
+
+        def link_scale(which):
+            if link.get() and not busy["on"]:
+                other = "sy" if which == "sx" else "sx"
+                busy["on"] = True
+                vars_[other].set(vars_[which].get())
+                busy["on"] = False
+
+        def row(r, key, label, lo, hi, step=1):
+            ttk.Label(body, text=label).grid(row=r, column=0, sticky="w", pady=3)
+            v = tk.DoubleVar(value=out.xf.get(key, 0))
+            vars_[key] = v
+            sc = tk.Scale(body, from_=lo, to=hi, orient="horizontal", resolution=step, variable=v, length=230, showvalue=False,
+                          bg=theme["BG"], fg=theme["FG"], troughcolor=theme["PANEL"], highlightthickness=0, bd=0)
+            sc.grid(row=r, column=1, padx=8)
+            ent = ttk.Spinbox(body, from_=lo, to=hi, increment=step, textvariable=v, width=7, format="%.0f")
+            ent.grid(row=r, column=2)
+            if key in ("sx", "sy"):
+                v.trace_add("write", lambda *_a, k=key: (link_scale(k), push()))
+            else:
+                v.trace_add("write", push)
+            ent.bind("<Return>", lambda e: push())
+
+        ttk.Label(body, text=self.t("xf_rot"), style="PanelBold.TLabel" if False else "TLabel").grid(row=0, column=0, sticky="w", pady=3)
+        rv = tk.IntVar(value=out.xf.get("rot", 0))
+        vars_["rot"] = rv
+        rb = ttk.Frame(body)
+        rb.grid(row=0, column=1, columnspan=2, sticky="w", padx=8)
+        for deg in (0, 90, 180, 270):
+            ttk.Radiobutton(rb, text=f"{deg}°", value=deg, variable=rv, command=push, takefocus=False).pack(side="left", padx=(0, 10))
+        link = tk.BooleanVar(value=abs(out.xf.get("sx", 100) - out.xf.get("sy", 100)) < 0.5)
+        row(1, "sx", self.t("xf_sx"), 10, 400)
+        row(2, "sy", self.t("xf_sy"), 10, 400)
+        ttk.Checkbutton(body, text=self.t("xf_link"), variable=link, takefocus=False).grid(row=3, column=1, sticky="w", padx=8)
+        ttk.Label(body, text=self.t("xf_crop"), font=("Segoe UI", 9, "bold")).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 2))
+        for k, (key, lab) in enumerate((("t", "co_t"), ("b", "co_b"), ("l", "co_l"), ("r", "co_r"))):
+            row(5 + k, key, self.t(lab), 0, 90)
+        ttk.Label(body, text=self.t("xf_hint"), style="Hint.TLabel", wraplength=470, justify="left").grid(row=9, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+        def reset():
+            busy["on"] = True
+            for k, v in xf_default().items():
+                vars_[k].set(v)
+            busy["on"] = False
+            push()
+        bar = ttk.Frame(body)
+        bar.grid(row=10, column=0, columnspan=3, sticky="e", pady=(10, 0))
+        ttk.Button(bar, text=self.t("xf_reset"), command=reset, takefocus=False).pack(side="left", padx=(0, 6))
+        ttk.Button(bar, text=self.t("btn_close"), command=win.destroy, takefocus=False).pack(side="left")
+        self.root.update_idletasks()
+        try:
+            win.geometry(f"+{self.root.winfo_rootx() + 80}+{self.root.winfo_rooty() + 80}")
+        except tk.TclError:
+            pass
+
     def _commit_output_name(self, out):
         if out not in self.outs:
             return
@@ -17158,10 +17688,12 @@ class App:
             n += 1
         return n
 
-    def add_output(self, num=None, name=None, res=None, fps=None, vol=None, ndi=False, q=None, screen="auto", audio=None):
+    def add_output(self, num=None, name=None, res=None, fps=None, vol=None, ndi=False, q=None, screen="auto", audio=None, xf=None):
         if num is None or any(o.num == num for o in self.outs):
             num = self._next_output_num()
         out = Output(num, name)
+        if xf is not None:
+            out.xf = xf_clean(xf)
         if audio is not None:
             out.ar = ar_clean(audio)
         if screen == "auto":
@@ -17175,6 +17707,8 @@ class App:
         self.outs.sort(key=lambda o: o.num)
         self.outs_empty_lbl.pack_forget()
         self._build_output_column(self.out_inner, out, before=before)
+        if not xf_is_default(out.xf):
+            out.xf_btn.configure(text="⤢•")
         if res:
             out.res_var.set(res)
         if fps:
@@ -17239,6 +17773,7 @@ class App:
                          "volume": int(round(float(o.vol.get()))),
                          "ndi": o.ndi_sender is not None, "audio": getattr(o, "ar", None) or ar_default(),
                          "ndi_quality": o.q_var.get() if hasattr(o, "q_var") else "1",
+                         "transform": dict(getattr(o, "xf", None) or xf_default()),
                          "screen": list(o.sel_geo) if o.sel_geo is not None else None})
         return data
 
@@ -17270,6 +17805,7 @@ class App:
                 self.add_output(num=n, name=name[:40] if name else None, screen=screen,
                                 res=self._clean_fmt(od.get("resolution")), fps=self._clean_fmt(od.get("fps")),
                                 vol=num(od.get("volume"), None, 0, 100), ndi=od.get("ndi") is True, audio=od.get("audio"),
+                                xf=od.get("transform"),
                                 q=od.get("ndi_quality") if od.get("ndi_quality") in self.NDI_QUALITIES else None)
         else:
             for n in sorted({it["output"] for it in items if not it.get("is_group")}):
